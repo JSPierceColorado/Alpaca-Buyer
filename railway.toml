@@ -1,0 +1,9 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Railway CRON is UTC. These are noon MDT and noon MST respectively.
+# main.py's America/Denver guard skips whichever is NOT noon locally.
+cronSchedule = "0 18,19 * * *"
+restartPolicyType = "NEVER"
