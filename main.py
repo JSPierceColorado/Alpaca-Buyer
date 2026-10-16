@@ -29,6 +29,7 @@ SCOPE = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9][A-Z0-9./-]{0,24}$")
 PERCENT = Decimal("0.02")
 CENT = Decimal("0.01")
+MIN_NOTIONAL = Decimal("1.00")
 
 
 def setting_bool(name: str, default: bool) -> bool:
@@ -86,7 +87,7 @@ def load_symbols() -> list[str]:
         response.raise_for_status()
         payload = response.json()
     symbols = clean_symbols(payload.get("values", []))
-    LOG.info("Read %d unique tickers from %s!E2:E", len(symbols), tab)
+    LOG.info("Read %d unique tickers from %s!E2:E: %s", len(symbols), tab, ", ".join(symbols) or "(empty)")
     return symbols
 
 
@@ -102,6 +103,18 @@ def money(value) -> Decimal:
 
 def two_percent(buying_power) -> Decimal:
     return (money(buying_power) * PERCENT).quantize(CENT, rounding=ROUND_DOWN)
+
+
+def order_notional(eligible_buying_power) -> Decimal | None:
+    """Use 2% of *current* usable BP, with a $1 floor (never exceed BP).
+
+    Alpaca requires $1+ buys. If less than $1 buying power remains, no
+    order can be submitted. Percent-based buys are rounded down to cents.
+    """
+    available = money(eligible_buying_power)
+    if available < MIN_NOTIONAL:
+        return None
+    return min(available, max(MIN_NOTIONAL, two_percent(available)))
 
 
 def order_id(trade_day: str, symbol: str) -> str:
@@ -231,12 +244,18 @@ def trade_once(client: TradingClient, symbols: list[str], dry_run: bool, trading
                 continue
 
             account = client.get_account()  # Refresh after each preceding order.
-            power = account.non_marginable_buying_power if crypto else account.buying_power
-            dollars = two_percent(power)
-            if dollars < Decimal("1.00"):
-                LOG.info("SKIP %s: 2%% of eligible buying power is under $1", ticker)
+            # Only marginable equities may use margin-based buying power.
+            # Crypto and non-marginable equities require non-margin buying power.
+            can_use_margin = not crypto and bool(getattr(asset, "marginable", True))
+            power = money(account.buying_power if can_use_margin else account.non_marginable_buying_power)
+            dollars = order_notional(power)
+            if dollars is None:
+                LOG.info("SKIP %s: eligible buying power $%s is below $1 minimum", ticker, power)
                 skipped += 1
                 continue
+            LOG.info("SIZE %s: eligible buying power=$%s, 2%%=$%s, order=$%s (%s)",
+                     ticker, power, two_percent(power), dollars,
+                     "margin-inclusive" if can_use_margin else "non-margin")
             # Crypto market orders max out at $200k; conservative broker-side cap.
             if crypto and dollars > Decimal("200000.00"):
                 LOG.warning("SKIP %s: crypto notional exceeds broker's $200k limit", ticker)
@@ -245,8 +264,7 @@ def trade_once(client: TradingClient, symbols: list[str], dry_run: bool, trading
 
             identity = order_id(trading_day, ticker)
             if dry_run:
-                LOG.info("DRY_RUN BUY %s $%s (%s buying power) id=%s", ticker, dollars,
-                         "cash/non-margin" if crypto else "margin-inclusive", identity)
+                LOG.info("DRY_RUN BUY %s $%s id=%s", ticker, dollars, identity)
                 continue
             if existing_order(client, identity):
                 LOG.info("SKIP %s: today's order already exists (%s)", ticker, identity)

@@ -1,12 +1,12 @@
 # Alpaca Auto-Buyer
 
-Reads **AI Investment Opportunity Tracker — Personal** → **Recommendations!E2:E**, removes duplicate tickers, skips assets already held in the Alpaca account, and buys **2% of current eligible buying power per remaining Alpaca-tradable asset** at **12 noon America/Denver** daily.
+Reads **AI Investment Opportunity Tracker — Personal** → **Recommendations!E2:E**, removes duplicate tickers, skips assets already held in the Alpaca account, and buys **the greater of $1 or 2% of current eligible buying power per remaining Alpaca-tradable asset** (only if at least $1 of usable buying power is available) at **12 noon America/Denver** daily.
 
-- Stocks/ETFs: 2% of Alpaca `buying_power` (including any permitted margin); requires market open, tradable + fractionable security; market DAY order.
-- Crypto: 2% of Alpaca `non_marginable_buying_power` (no margin); market GTC order; USD pairs only (e.g. sheet `BTC` resolves to `BTC/USD`).
-- Order size recalculated *sequentially* just before each symbol, so later orders can be smaller as buying power decreases. This is **not** 2% total split across all symbols.
+- Stocks/ETFs: max($1, 2%) of Alpaca `buying_power` for marginable assets; for non-marginable stocks use `non_marginable_buying_power`. Requires at least $1 usable buying power, market open, tradable + fractionable security; market DAY order.
+- Crypto: max($1, 2%) of Alpaca `non_marginable_buying_power` (no margin), provided at least $1 is available; market GTC order; USD pairs only (e.g. sheet `BTC` resolves to `BTC/USD`).
+- Order size recalculated *sequentially* just before each symbol, so later orders can be smaller as buying power decreases. This is **not** 2% total split across all symbols. A $1 floor applies only when at least $1 of *eligible* buying power remains; never attempt a $1 order with less than $1 available.
 - **Before each buy, check `TradingClient.get_all_positions()` and skip any asset with an existing open position, long or short.** For crypto, `BTC/USD` and `BTCUSD` are treated as the same holding. If Alpaca's positions endpoint fails, **abort all remaining buys** rather than assume the account owns nothing. An asset becomes eligible again after its entire position is closed.
-- Duplicate rows and symbol aliases are deduplicated. A deterministic daily `client_order_id` prevents repeat purchases on restart or retrigger after successful placement. If Alpaca order lookup fails, **no order is sent**. Ambiguous submission failures are not auto-retried.
+- Sheet-read logs report the number and symbols read (or explicitly report empty rows), and order logs show available eligible buying power, 2% calculation, and chosen notional. Duplicate rows and symbol aliases are deduplicated. A deterministic daily `client_order_id` prevents repeat purchases on restart or retrigger after successful placement. If Alpaca order lookup fails, **no order is sent**. Ambiguous submission failures are not auto-retried.
 - Never automatically sells. Does not read column H (broker) because the requirement is **any unique asset in column E**, provided Alpaca offers it.
 - Only US equities and USD-quoted cryptocurrencies are supported. Unsupported symbols, nonfractionable equities, and market-closed equities are skipped.
 - **Defaults: `DRY_RUN=true`, `ALPACA_PAPER=true`, `ENABLE_LIVE_TRADING=false`**. No live purchases happen until explicitly changed.
@@ -36,7 +36,7 @@ Reads **AI Investment Opportunity Tracker — Personal** → **Recommendations!E
 
 ## Margin / risk disclosures
 
-This bot **does not intentionally add to an existing open position**: held assets are skipped each run. It can buy an asset again after the position is fully closed. This rule checks holdings, not every possible unfilled buy order or concurrent external trade; another system acting at the same moment could still change the account between a check and submission. With margin enabled, `buying_power` is *not cash*: borrowing can create interest costs and margin calls, and forced liquidation may occur. The 2% purchase limit is **per ticker** rather than per day; many rows can collectively create substantial exposure. Fractional market orders have no guaranteed fill price. Alpaca crypto fees and eligibility rules apply. Order logs mean submission, **not guaranteed execution**. Do not enable real-money mode without first validating a paper run and understanding these exposures.
+This bot **does not intentionally add to an existing open position**: held assets are skipped each run. It can buy an asset again after the position is fully closed. This rule checks holdings, not every possible unfilled buy order or concurrent external trade; another system acting at the same moment could still change the account between a check and submission. With margin enabled, `buying_power` is *not cash*: borrowing can create interest costs and margin calls, and forced liquidation may occur. The max($1, 2%) purchase amount is **per ticker** rather than per day; many rows can collectively create substantial exposure. Fractional market orders have no guaranteed fill price. Alpaca crypto fees and eligibility rules apply. Order logs mean submission, **not guaranteed execution**. Do not enable real-money mode without first validating a paper run and understanding these exposures.
 
 ## Local dry-run
 
@@ -54,3 +54,15 @@ python main.py --test-now
 - For equities, Alpaca's market clock is consulted (weekends and exchange holidays skip stocks). Crypto can run seven days a week.
 - The bot does not guarantee fills, available prices, or an execution precisely at noon. It submits market orders when the conditions above are met.
 - Only this worker should use its daily order-ID namespace to retain exact one-buy-per-symbol/day idempotency.
+
+## Small-account sizing examples
+
+| Eligible buying power | 2% | Order amount |
+| ---: | ---: | ---: |
+| $0.75 | $0.01 | Skip: less than $1 is available |
+| $20 | $0.40 | $1.00 |
+| $49.99 | $0.99 | $1.00 |
+| $77 | $1.54 | $1.54 |
+| $500 | $10.00 | $10.00 |
+
+**Diagnostic note:** If your account really has **$77 of eligible buying power**, the previous 2% algorithm would already have proposed a $1.54 order. Failing to buy under those circumstances means something else blocked the order (e.g. the deployment has no source, credentials missing, dry run, existing position, market closure, account restrictions, or broker rejection). Check Railway deploy and run logs.

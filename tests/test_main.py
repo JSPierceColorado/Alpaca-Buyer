@@ -22,6 +22,82 @@ class CoreTests(TestCase):
         with self.assertRaises(ValueError):
             main.two_percent(None)
 
+    def test_minimum_one_dollar_and_eligible_buying_power_ceiling(self):
+        cases = {
+            "0": None,
+            "0.99": None,
+            "1": Decimal("1.00"),
+            "25": Decimal("1.00"),
+            "49.99": Decimal("1.00"),
+            "50": Decimal("1.00"),
+            "77": Decimal("1.54"),
+            "100": Decimal("2.00"),
+            "500": Decimal("10.00"),
+            "10000.99": Decimal("200.01"),
+        }
+        for power, expected in cases.items():
+            with self.subTest(power=power):
+                self.assertEqual(main.order_notional(power), expected)
+        with self.assertRaises(ValueError):
+            main.order_notional(None)
+
+    def test_one_dollar_stock_order_with_low_usable_buying_power(self):
+        client = mock.MagicMock()
+        client.get_account.return_value = SimpleNamespace(
+            trading_blocked=False, account_blocked=False, status="ACTIVE",
+            buying_power="20", non_marginable_buying_power="20")
+        client.get_clock.return_value.is_open = True
+        client.get_all_assets.return_value = []
+        client.get_asset.return_value = asset("SPGI")
+        client.get_all_positions.return_value = []
+        client.submit_order.return_value.id = "paper-test-id"
+        with mock.patch.object(main, "existing_order", return_value=False):
+            bought, skipped, errors = main.trade_once(client, ["SPGI"], False, "2026-10-15")
+        self.assertEqual((bought, skipped, errors), (1, 0, 0))
+        self.assertEqual(client.submit_order.call_args.kwargs["order_data"].notional, 1.0)
+
+    def test_crypto_one_dollar_floor_uses_cash_not_margin(self):
+        client = mock.MagicMock()
+        client.get_account.return_value = SimpleNamespace(
+            trading_blocked=False, account_blocked=False, status="ACTIVE",
+            buying_power="10000", non_marginable_buying_power="20")
+        client.get_clock.return_value.is_open = False
+        client.get_all_assets.return_value = [asset("BTC/USD", AssetClass.CRYPTO)]
+        client.get_all_positions.return_value = []
+        client.submit_order.return_value.id = "paper-test-id"
+        with mock.patch.object(main, "existing_order", return_value=False):
+            bought, skipped, errors = main.trade_once(client, ["BTC"], False, "2026-10-15")
+        self.assertEqual((bought, skipped, errors), (1, 0, 0))
+        self.assertEqual(client.submit_order.call_args.kwargs["order_data"].notional, 1.0)
+
+    def test_sub_dollar_available_power_does_not_place_order(self):
+        client = mock.MagicMock()
+        client.get_account.return_value = SimpleNamespace(
+            trading_blocked=False, account_blocked=False, status="ACTIVE",
+            buying_power="0.75", non_marginable_buying_power="0.75")
+        client.get_clock.return_value.is_open = True
+        client.get_all_assets.return_value = []
+        client.get_asset.return_value = asset("SPGI")
+        client.get_all_positions.return_value = []
+        self.assertEqual(main.trade_once(client, ["SPGI"], False, "2026-10-15"), (0, 1, 0))
+        client.submit_order.assert_not_called()
+
+    def test_non_marginable_stock_does_not_use_margin(self):
+        client = mock.MagicMock()
+        client.get_account.return_value = SimpleNamespace(
+            trading_blocked=False, account_blocked=False, status="ACTIVE",
+            buying_power="5000", non_marginable_buying_power="20")
+        client.get_clock.return_value.is_open = True
+        client.get_all_assets.return_value = []
+        stock = asset("SPGI")
+        stock.marginable = False
+        client.get_asset.return_value = stock
+        client.get_all_positions.return_value = []
+        client.submit_order.return_value.id = "paper-test-id"
+        with mock.patch.object(main, "existing_order", return_value=False):
+            self.assertEqual(main.trade_once(client, ["SPGI"], False, "2026-10-15"), (1, 0, 0))
+        self.assertEqual(client.submit_order.call_args.kwargs["order_data"].notional, 1.0)
+
     def test_order_id_stable_and_short(self):
         a = main.order_id("2026-10-14", "BTC/USD")
         self.assertEqual(a, main.order_id("2026-10-14", "btc/usd"))
