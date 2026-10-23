@@ -1,7 +1,6 @@
-"""Daily Google Sheets -> Alpaca buyer. Default: PAPER + DRY_RUN.
+"""Perpetual Google Sheets -> Alpaca buyer, daily at 1:30 PM Denver time.
 
-Railway cron: 0 18,19 * * * (UTC). The Mountain-time hour guard ensures
-that exactly one of these two scheduled starts is eligible year-round.
+Default: PAPER + DRY_RUN. No Railway cron or additional environment variables.
 """
 
 import argparse
@@ -10,7 +9,8 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+import time
+from datetime import datetime, time as clock_time, timedelta
 from decimal import Decimal, ROUND_DOWN
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -293,10 +293,33 @@ def trade_once(client: TradingClient, symbols: list[str], dry_run: bool, trading
     return bought, skipped, errors
 
 
+def execute_daily_run(paper: bool, dry_run: bool, now: datetime) -> None:
+    """Run the existing sheet reader and Alpaca trading logic once."""
+    key = os.environ.get("ALPACA_API_KEY", "").strip()
+    secret = os.environ.get("ALPACA_SECRET_KEY", "").strip()
+    if not key or not secret:
+        raise RuntimeError("Set ALPACA_API_KEY and ALPACA_SECRET_KEY in Railway")
+
+    symbols = load_symbols()
+    client = TradingClient(key, secret, paper=paper)
+    LOG.info("Account mode=%s dry_run=%s day=%s", "PAPER" if paper else "LIVE", dry_run, now.date())
+    _, _, errors = trade_once(client, symbols, dry_run, now.date().isoformat())
+    if errors:
+        LOG.error("Daily run completed with %d ticker errors; review the log", errors)
+
+
+def next_run_time(now: datetime) -> datetime:
+    """Next 13:30 local time, respecting DST with ZoneInfo."""
+    scheduled = datetime.combine(now.date(), clock_time(13, 30), tzinfo=TIMEZONE)
+    if now >= scheduled:
+        scheduled = datetime.combine(now.date() + timedelta(days=1), clock_time(13, 30), tzinfo=TIMEZONE)
+    return scheduled
+
+
 def main() -> int:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--test-now", action="store_true", help="Bypass noon guard for dry-run testing ONLY")
+    parser.add_argument("--test-now", action="store_true", help="Run once immediately in DRY_RUN mode only")
     args = parser.parse_args()
 
     paper = setting_bool("ALPACA_PAPER", True)
@@ -307,21 +330,37 @@ def main() -> int:
     if args.test_now and not dry_run:
         raise RuntimeError("--test-now is allowed only when DRY_RUN=true")
 
-    now = datetime.now(TIMEZONE)
-    if not args.test_now and now.hour != 12:
-        LOG.info("Outside 12:00-12:59 America/Denver (%s): no trade", now.isoformat())
+    if args.test_now:
+        execute_daily_run(paper, dry_run, datetime.now(TIMEZONE))
         return 0
 
-    key = os.environ.get("ALPACA_API_KEY", "").strip()
-    secret = os.environ.get("ALPACA_SECRET_KEY", "").strip()
-    if not key or not secret:
-        raise RuntimeError("Set ALPACA_API_KEY and ALPACA_SECRET_KEY in Railway")
-
-    symbols = load_symbols()
-    client = TradingClient(key, secret, paper=paper)
-    LOG.info("Account mode=%s dry_run=%s day=%s", "PAPER" if paper else "LIVE", dry_run, now.date())
-    _, _, errors = trade_once(client, symbols, dry_run, now.date().isoformat())
-    return 1 if errors else 0
+    # Track dates in memory: no repeat run after an ordinary restart within the
+    # same process. Restarts in the catch-up window are further protected by
+    # Alpaca's stable daily client order IDs and position checks.
+    last_run_date = None
+    LOG.info("Scheduler started: daily at 13:30 America/Denver; paper=%s dry_run=%s", paper, dry_run)
+    while True:
+        now = datetime.now(TIMEZONE)
+        today_1330 = datetime.combine(now.date(), clock_time(13, 30), tzinfo=TIMEZONE)
+        catchup_end = datetime.combine(now.date(), clock_time(14, 0), tzinfo=TIMEZONE)
+        if today_1330 <= now < catchup_end and last_run_date != now.date():
+            last_run_date = now.date()  # Do not hammer an unavailable API.
+            LOG.info("Starting daily run at %s", now.isoformat())
+            try:
+                execute_daily_run(paper, dry_run, now)
+            except Exception:
+                LOG.exception("Daily run failed; next automatic attempt is tomorrow")
+            continue
+        upcoming = next_run_time(now)
+        # During 13:30-13:59, once attempted, show tomorrow as the next run.
+        LOG.info("Next scheduled run: %s", upcoming.isoformat())
+        while True:
+            current = datetime.now(TIMEZONE)
+            if today_1330 <= current < catchup_end and last_run_date != current.date():
+                break
+            if current >= upcoming:
+                break
+            time.sleep(min(60, max(1, (upcoming - current).total_seconds())))
 
 
 if __name__ == "__main__":
